@@ -1,6 +1,6 @@
 {
     "private": true,
-    "name": "@vendorname/your-dapp-name",
+    "name": "@bertiespell/consensus",
     "description": "Your dApp description",
     "version": "0.0.1",
     "contributors": [

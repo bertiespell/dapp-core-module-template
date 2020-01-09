@@ -5,7 +5,7 @@ import { DappManager } from "./manager";
 export const plugin: Container.IPluginDescriptor = {
     pkg: require("../package.json"),
     defaults,
-    alias: "dapp-core-template",
+    alias: "consensus",
     async register(container: Container.IContainer, options) {
         if (!options.enabled) {
             container
@@ -24,7 +24,7 @@ export const plugin: Container.IPluginDescriptor = {
     },
 
     async deregister(container: Container.IContainer) {
-        const dappManager = container.resolvePlugin("dapp-core-template");
+        const dappManager = container.resolvePlugin("consensus");
 
         if (dappManager) {
             container
