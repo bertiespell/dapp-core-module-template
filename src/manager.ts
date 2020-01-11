@@ -5,26 +5,28 @@ import { Wallets } from "@arkecosystem/core-state";
 import { roundCalculator } from "@arkecosystem/core-utils";
 import { Crypto, Enums, Identities, Interfaces, Utils } from "@arkecosystem/crypto";
 import cloneDeep from "lodash.clonedeep";
-
-// export interface IDappManagerOptions {
-//     database_service: IDatabaseService;
-// };
+import pluralize from "pluralize";
 
 export class DappManager {
+    public forgingDelegates: State.IWallet[] = undefined;
+
     private readonly logger: Logger.ILogger = app.resolvePlugin<Logger.ILogger>(
         "logger"
     );
 
     private databaseService: IDatabaseService = undefined;
+    private walletManager: State.IWalletManager = undefined;
 
     /**
      * Your dApp init code goes here
      * @param options - from default.ts
+     * TODO: create type for options
      */
     public start(options: any) {
         this.logger.info("Initialization of dApp");
         if (options.database_service) {
             this.databaseService = options.database_service;
+            this.walletManager = options.database_service.walletManager; // TODO: handle errors?
         } else {
             // error handling
         }
@@ -40,7 +42,6 @@ export class DappManager {
     public async getActiveDelegates(
         roundInfo?: Shared.IRoundInfo,
         delegates?: State.IWallet[],
-        forgingDelegates?: State.IWallet[],
     ): Promise<State.IWallet[]> {
  
         if (!roundInfo) {
@@ -49,25 +50,25 @@ export class DappManager {
             roundInfo = roundCalculator.calculateRound(lastBlock.data.height);
         }
 
-        const { round } = roundInfo; // check the round
+        const { round } = roundInfo;
 
         if (
-            forgingDelegates &&
-            forgingDelegates.length &&
-            forgingDelegates[0].getAttribute<number>("delegate.round") === round
+            this.forgingDelegates &&
+            this.forgingDelegates.length &&
+            this.forgingDelegates[0].getAttribute<number>("delegate.round") === round
         ) {
-            return forgingDelegates;
+            return this.forgingDelegates;
         }
 
         // When called during applyRound we already know the delegates, so we don't have to query the database.
         if (!delegates || delegates.length === 0) {
-            delegates = (await this.databaseService.connection.roundsRepository.findById(round)).map(({ round, publicKey, balance }) =>
+            delegates = (await this.databaseService.connection.roundsRepository.findById(round)).map(({ publicKey, balance }) =>
                 Object.assign(new Wallets.Wallet(Identities.Address.fromPublicKey(publicKey)), {
                     publicKey,
                     attributes: {
                         delegate: {
                             voteBalance: Utils.BigNumber.make(balance),
-                            username: this.databaseService.walletManager.findByPublicKey(publicKey).getAttribute("delegate.username"),
+                            username: this.walletManager.findByPublicKey(publicKey).getAttribute("delegate.username"),
                         },
                     },
                 }),
@@ -126,7 +127,7 @@ export class DappManager {
         ) {
 
             const vote: string = transaction.asset.votes[0];
-            const delegate: State.IWallet = this.databaseService.walletManager.findByPublicKey(vote.substr(1));
+            const delegate: State.IWallet = this.walletManager.findByPublicKey(vote.substr(1));
             let voteBalance: Utils.BigNumber = delegate.getAttribute("delegate.voteBalance", Utils.BigNumber.ZERO);
 
             if (vote.startsWith("+")) {
@@ -143,7 +144,7 @@ export class DappManager {
         } else {
             // Update vote balance of the sender's delegate
             if (sender.hasVoted()) {
-                const delegate: State.IWallet = this.databaseService.walletManager.findByPublicKey(sender.getAttribute("vote"));
+                const delegate: State.IWallet = this.walletManager.findByPublicKey(sender.getAttribute("vote"));
                 const amount =
                     transaction.type === Enums.TransactionType.MultiPayment &&
                     transaction.typeGroup === Enums.TransactionTypeGroup.Core
@@ -187,7 +188,7 @@ export class DappManager {
                 lockWallet.hasAttribute("vote")
             ) {
                 // HTLC Claim transfers the locked amount to the lock recipient's (= claim sender) delegate vote balance
-                const lockWalletDelegate: State.IWallet = this.databaseService.walletManager.findByPublicKey(lockWallet.getAttribute("vote"));
+                const lockWalletDelegate: State.IWallet = this.walletManager.findByPublicKey(lockWallet.getAttribute("vote"));
                 const lockWalletDelegateVoteBalance: Utils.BigNumber = lockWalletDelegate.getAttribute(
                     "delegate.voteBalance",
                     Utils.BigNumber.ZERO,
@@ -206,10 +207,10 @@ export class DappManager {
             ) {
                 // go through all payments and update recipients delegates vote balance
                 for (const { recipientId, amount } of transaction.asset.payments) {
-                    const recipientWallet: State.IWallet = this.databaseService.walletManager.findByAddress(recipientId);
+                    const recipientWallet: State.IWallet = this.walletManager.findByAddress(recipientId);
                     const vote = recipientWallet.getAttribute("vote");
                     if (vote) {
-                        const delegate: State.IWallet = this.databaseService.walletManager.findByPublicKey(vote);
+                        const delegate: State.IWallet = this.walletManager.findByPublicKey(vote);
                         const voteBalance: Utils.BigNumber = delegate.getAttribute(
                             "delegate.voteBalance",
                             Utils.BigNumber.ZERO,
@@ -229,7 +230,7 @@ export class DappManager {
                 (transaction.type !== Enums.TransactionType.HtlcLock ||
                     transaction.typeGroup !== Enums.TransactionTypeGroup.Core)
             ) {
-                const delegate: State.IWallet = this.databaseService.walletManager.findByPublicKey(recipient.getAttribute("vote"));
+                const delegate: State.IWallet = this.walletManager.findByPublicKey(recipient.getAttribute("vote"));
                 const voteBalance: Utils.BigNumber = delegate.getAttribute(
                     "delegate.voteBalance",
                     Utils.BigNumber.ZERO,
@@ -243,10 +244,42 @@ export class DappManager {
         }
     }
 
+    public buildVoteBalances(): void {
+        for (const voter of this.walletManager.allByPublicKey()) {
+            if (voter.hasVoted()) {
+                const delegate: State.IWallet = this.walletManager.findByPublicKey(voter.getAttribute<string>("vote"));
+                const voteBalance: Utils.BigNumber = delegate.getAttribute("delegate.voteBalance");
+                const lockedBalance = voter.getAttribute("htlc.lockedBalance", Utils.BigNumber.ZERO);
+                delegate.setAttribute("delegate.voteBalance", voteBalance.plus(voter.balance).plus(lockedBalance));
+            }
+        }
+    }
+
+    public async initializeActiveDelegates(height: number): Promise<void> {
+        this.forgingDelegates = undefined;
+
+        const roundInfo: Shared.IRoundInfo = roundCalculator.calculateRound(height)
+
+        await this.setForgingDelegatesOfRound(roundInfo, await this.calcPreviousActiveDelegates(roundInfo));
+    }
+
+    public async updateForgingDelegatesOfRound(roundInfo: Shared.IRoundInfo, blocks: Interfaces.IBlock[]): Promise<void> {
+        this.setForgingDelegatesOfRound(roundInfo,
+            await this.calcPreviousActiveDelegates(roundInfo, blocks))
+    }
+
+    public async updateDelegates(roundInfo?: Shared.IRoundInfo): Promise<State.IWallet[]> {
+        const delegates = this.buildDelegateRanking(roundInfo);
+        await this.setForgingDelegatesOfRound(roundInfo, delegates);
+        return delegates;
+    }
+
+    // could be a private method based on deprecated/refactored methods elsewhere
     public buildDelegateRanking(roundInfo?: Shared.IRoundInfo): State.IWallet[] {
+        
         const delegatesActive: State.IWallet[] = [];
 
-        for (const delegate of this.databaseService.walletManager.allByUsername()) {
+        for (const delegate of this.walletManager.allByUsername()) {
             if (delegate.hasAttribute("delegate.resigned")) {
                 delegate.forgetAttribute("delegate.rank");
             } else {
@@ -287,8 +320,56 @@ export class DappManager {
             for (const delegate of delegatesSorted) {
                 delegate.setAttribute("delegate.round", roundInfo.round);
             }
+
+            const { maxDelegates } = roundInfo;
+
+            if (delegatesSorted.length < maxDelegates) {
+                throw new Error(
+                    `Expected to find ${maxDelegates} delegates but only found ${delegatesSorted.length}. ` +
+                        `This indicates an issue with the genesis block & delegates.`,
+                );
+            }
+
+            this.logger.debug(`Loaded ${delegatesSorted.length} active ${pluralize("delegate", delegatesSorted.length)}`);
         }
 
         return delegatesSorted;
+    }
+
+
+    private async setForgingDelegatesOfRound(roundInfo: Shared.IRoundInfo, delegates?: State.IWallet[]): Promise<void> {
+        this.forgingDelegates = await this.getActiveDelegates(roundInfo, delegates);
+    }
+
+    private async calcPreviousActiveDelegates(
+        roundInfo: Shared.IRoundInfo,
+        blocks?: Interfaces.IBlock[],
+    ): Promise<State.IWallet[]> {
+        blocks = blocks || (await this.databaseService.getBlocksForRound(roundInfo));
+
+        const tempWalletManager = this.walletManager.clone();
+
+        // Revert all blocks in reverse order
+        const index: number = blocks.length - 1;
+
+        let height: number = 0;
+        for (let i = index; i >= 0; i--) {
+            height = blocks[i].data.height;
+
+            if (height === 1) {
+                break;
+            }
+
+            await tempWalletManager.revertBlock(blocks[i]);
+        }
+
+        const delegates: State.IWallet[] = this.buildDelegateRanking(roundInfo);
+
+        for (const delegate of tempWalletManager.allByUsername()) {
+            const delegateWallet = this.walletManager.findByUsername(delegate.getAttribute("delegate.username"));
+            delegateWallet.setAttribute("delegate.rank", delegate.getAttribute("delegate.rank"));
+        }
+
+        return delegates;
     }
 }
